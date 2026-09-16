@@ -1,17 +1,18 @@
-use crate::{
-    field::RecordFields,
-    fmt::{format, FormatEvent, FormatFields, MakeWriter, TestWriter},
-    layer::{self, Context},
-    registry::{self, LookupSpan, SpanRef},
-};
 use alloc::{fmt, format, string::String};
 use core::{any::TypeId, marker::PhantomData, ops::Deref};
-use format::{FmtSpan, TimingDisplay};
 use std::{cell::RefCell, env, eprintln, io, thread_local, time::Instant};
+
+use format::{FmtSpan, TimingDisplay};
 use tracing_core::{
-    field,
+    Event, Metadata, Subscriber, field,
     span::{Attributes, Current, Id, Record},
-    Event, Metadata, Subscriber,
+};
+
+use crate::{
+    field::RecordFields,
+    fmt::{FormatEvent, FormatFields, MakeWriter, TestWriter, format},
+    layer::{self, Context},
+    registry::{self, LookupSpan, SpanRef},
 };
 
 /// A [`Layer`] that logs formatted representations of `tracing` events.
@@ -331,8 +332,8 @@ impl<S, N, E, W> Layer<S, N, E, W> {
     pub fn with_ansi(self, ansi: bool) -> Self {
         #[cfg(not(feature = "ansi"))]
         if ansi {
-            const ERROR: &str =
-                "tracing-subscriber: the `ansi` crate feature is required to enable ANSI terminal colors";
+            const ERROR: &str = "tracing-subscriber: the `ansi` crate feature is required to \
+                                 enable ANSI terminal colors";
             #[cfg(debug_assertions)]
             panic!("{}", ERROR);
             #[cfg(not(debug_assertions))]
@@ -1019,52 +1020,82 @@ where
             static BUF: RefCell<String> = const { RefCell::new(String::new()) };
         }
 
-        BUF.with(|buf| {
-            let borrow = buf.try_borrow_mut();
-            let mut a;
-            let mut b;
-            let mut buf = match borrow {
-                Ok(buf) => {
-                    a = buf;
-                    &mut *a
-                }
-                _ => {
-                    b = String::new();
-                    &mut b
-                }
-            };
-
-            let ctx = self.make_ctx(ctx, event);
-            if self
+        fn fmt_with<S, N, E, W>(
+            this: &Layer<S, N, E, W>,
+            event: &Event<'_>,
+            ctx: &'_ FmtContext<'_, S, N>,
+            mut buf: &mut String,
+        ) where
+            S: Subscriber + for<'a> LookupSpan<'a>,
+            N: for<'writer> FormatFields<'writer> + 'static,
+            E: FormatEvent<S, N> + 'static,
+            W: for<'writer> MakeWriter<'writer> + 'static,
+        {
+            if this
                 .fmt_event
                 .format_event(
                     &ctx,
                     format::Writer::new(&mut buf)
-                        .with_ansi(self.is_ansi)
-                        .with_ansi_sanitization(self.ansi_sanitization),
+                        .with_ansi(this.is_ansi)
+                        .with_ansi_sanitization(this.ansi_sanitization),
                     event,
                 )
                 .is_ok()
             {
-                let mut writer = self.make_writer.make_writer_for(event.metadata());
+                let mut writer = this.make_writer.make_writer_for(event.metadata());
                 let res = io::Write::write_all(&mut writer, buf.as_bytes());
-                if self.log_internal_errors {
+                if this.log_internal_errors {
                     if let Err(e) = res {
-                        eprintln!("[tracing-subscriber] Unable to write an event to the Writer for this Subscriber! Error: {}\n", e);
+                        eprintln!(
+                            "[tracing-subscriber] Unable to write an event to the Writer for this \
+                             Subscriber! Error: {}\n",
+                            e
+                        );
                     }
                 }
-            } else if self.log_internal_errors {
-                let err_msg = format!("Unable to format the following event. Name: {}; Fields: {:?}\n",
-                    event.metadata().name(), event.fields());
-                let mut writer = self.make_writer.make_writer_for(event.metadata());
+            } else if this.log_internal_errors {
+                let err_msg = format!(
+                    "Unable to format the following event. Name: {}; Fields: {:?}\n",
+                    event.metadata().name(),
+                    event.fields()
+                );
+                let mut writer = this.make_writer.make_writer_for(event.metadata());
                 let res = io::Write::write_all(&mut writer, err_msg.as_bytes());
                 if let Err(e) = res {
-                    eprintln!("[tracing-subscriber] Unable to write an \"event formatting error\" to the Writer for this Subscriber! Error: {}\n", e);
+                    eprintln!(
+                        "[tracing-subscriber] Unable to write an \"event formatting error\" to \
+                         the Writer for this Subscriber! Error: {}\n",
+                        e
+                    );
                 }
             }
 
             buf.clear();
-        });
+        }
+
+        let ctx = self.make_ctx(ctx, event);
+        if BUF
+            .try_with(|buf| {
+                let borrow = buf.try_borrow_mut();
+                let mut a;
+                let mut b;
+                let buf = match borrow {
+                    Ok(buf) => {
+                        a = buf;
+                        &mut *a
+                    }
+                    _ => {
+                        b = String::new();
+                        &mut b
+                    }
+                };
+
+                fmt_with(self, event, &ctx, buf);
+            })
+            .is_err()
+        {
+            fmt_with(self, event, &ctx, &mut String::new());
+        }
     }
 
     unsafe fn downcast_raw(&self, id: TypeId) -> Option<*const ()> {
@@ -1294,20 +1325,24 @@ impl Timings {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::fmt::{
-        self,
-        format::{self, test::MockTime, Format},
-        layer::Layer as _,
-        test::{MockMakeWriter, MockWriter},
-        time,
-    };
-    use crate::Registry;
     use alloc::{string::ToString, vec, vec::Vec};
+
     use format::FmtSpan;
     use regex::Regex;
     use tracing::subscriber::with_default;
     use tracing_core::dispatcher::Dispatch;
+
+    use super::*;
+    use crate::{
+        Registry,
+        fmt::{
+            self,
+            format::{self, Format, test::MockTime},
+            layer::Layer as _,
+            test::{MockMakeWriter, MockWriter},
+            time,
+        },
+    };
 
     #[test]
     fn impls() {
@@ -1459,8 +1494,8 @@ mod test {
         });
         let actual = sanitize_timings(make_writer.get_string());
         assert_eq!(
-            "fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: enter\n\
-             fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: exit\n",
+            "fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: enter\nfake time \
+             span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: exit\n",
             actual.as_str()
         );
     }
@@ -1482,7 +1517,8 @@ mod test {
         });
         let actual = sanitize_timings(make_writer.get_string());
         assert_eq!(
-            "fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: close timing timing\n",
+            "fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: close timing \
+             timing\n",
             actual.as_str()
         );
     }
@@ -1527,10 +1563,10 @@ mod test {
         });
         let actual = sanitize_timings(make_writer.get_string());
         assert_eq!(
-            "fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: new\n\
-             fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: enter\n\
-             fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: exit\n\
-             fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: close timing timing\n",
+            "fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: new\nfake time \
+             span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: enter\nfake time span1{x=42}: \
+             tracing_subscriber::fmt::fmt_layer::test: exit\nfake time span1{x=42}: \
+             tracing_subscriber::fmt::fmt_layer::test: close timing timing\n",
             actual.as_str()
         );
     }
@@ -1585,14 +1621,14 @@ mod test {
 
         let actual = sanitize_timings(make_writer1.get_string());
         assert_eq!(
-            "fake time writer1_span{x=42}:writer2_span: hello writer1!\n\
-             fake time writer1_span{x=42}: close timing timing\n",
+            "fake time writer1_span{x=42}:writer2_span: hello writer1!\nfake time \
+             writer1_span{x=42}: close timing timing\n",
             actual.as_str()
         );
         let actual = sanitize_timings(make_writer2.get_string());
         assert_eq!(
-            "fake time writer1_span{x=42}: hello writer2!\n\
-             fake time writer1_span{x=42}:writer2_span: close timing timing\n",
+            "fake time writer1_span{x=42}: hello writer2!\nfake time \
+             writer1_span{x=42}:writer2_span: close timing timing\n",
             actual.as_str()
         );
     }
@@ -1706,9 +1742,9 @@ mod test {
         });
         let actual = sanitize_timings(make_writer.get_string());
         assert_eq!(
-            "fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: enter\n\
-             fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: exit\n\
-             fake time span3{x=42}: tracing_subscriber::fmt::fmt_layer::test: exit\n",
+            "fake time span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: enter\nfake time \
+             span1{x=42}: tracing_subscriber::fmt::fmt_layer::test: exit\nfake time span3{x=42}: \
+             tracing_subscriber::fmt::fmt_layer::test: exit\n",
             actual.as_str()
         );
     }
